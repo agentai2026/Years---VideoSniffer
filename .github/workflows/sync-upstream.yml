@@ -1,0 +1,77 @@
+name: Maintenance
+
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+          echo "Default branch: ${DEFAULT_BRANCH}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          UPSTREAM_URL="https://github.com/Predidit/flutter-webview-windows.git"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "${UPSTREAM_URL}"
+          git fetch upstream --tags --prune
+
+          UPSTREAM_DEFAULT=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
+          if [ -z "${UPSTREAM_DEFAULT}" ]; then
+            UPSTREAM_DEFAULT="${DEFAULT_BRANCH}"
+          fi
+          echo "Upstream default branch: ${UPSTREAM_DEFAULT}"
+
+          # Force-copy all non-default branches from upstream
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/upstream/); do
+            branch="${ref#upstream/}"
+            if [ "${branch}" = "HEAD" ]; then
+              continue
+            fi
+            if [ "${branch}" = "${UPSTREAM_DEFAULT}" ] || [ "${branch}" = "${DEFAULT_BRANCH}" ]; then
+              continue
+            fi
+            echo "Force-updating branch: ${branch}"
+            git push --force origin "refs/remotes/upstream/${branch}:refs/heads/${branch}"
+          done
+
+          # Merge upstream default into local default, preferring ours for conflicts
+          # so the Maintenance workflow file is preserved.
+          git checkout "${DEFAULT_BRANCH}"
+          git pull --ff-only origin "${DEFAULT_BRANCH}" || true
+          git merge -X ours "upstream/${UPSTREAM_DEFAULT}" --no-edit -m "chore: merge upstream ${UPSTREAM_DEFAULT}" || {
+            echo "Merge reported issues; attempting to complete with ours strategy..."
+            git checkout --ours . || true
+            git add -A
+            git commit --trailer "Co-authored-by: Cursor <cursoragent@cursor.com>" --no-edit || true
+          }
+
+          # Ensure workflow file still exists after merge
+          if [ ! -f .github/workflows/sync-upstream.yml ]; then
+            echo "ERROR: sync workflow missing after merge"
+            exit 1
+          fi
+
+          git push origin "${DEFAULT_BRANCH}"
+
+          # Force-copy all tags from upstream
+          git push --force origin "refs/tags/*:refs/tags/*" || true
