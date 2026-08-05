@@ -42,9 +42,9 @@ jobs:
           echo "Upstream default branch: ${UPSTREAM_DEFAULT}"
 
           # Force-copy all non-default branches from upstream
-          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/upstream/); do
-            branch="${ref#upstream/}"
-            if [ "${branch}" = "HEAD" ]; then
+          while IFS= read -r ref; do
+            branch="${ref#refs/remotes/upstream/}"
+            if [ "${branch}" = "HEAD" ] || [ -z "${branch}" ]; then
               continue
             fi
             if [ "${branch}" = "${UPSTREAM_DEFAULT}" ] || [ "${branch}" = "${DEFAULT_BRANCH}" ]; then
@@ -52,18 +52,24 @@ jobs:
             fi
             echo "Force-updating branch: ${branch}"
             git push --force origin "refs/remotes/upstream/${branch}:refs/heads/${branch}"
-          done
+          done < <(git for-each-ref --format='%(refname)' refs/remotes/upstream/)
 
           # Merge upstream default into local default, preferring ours for conflicts
           # so the Maintenance workflow file is preserved.
           git checkout "${DEFAULT_BRANCH}"
           git pull --ff-only origin "${DEFAULT_BRANCH}" || true
-          git merge -X ours "upstream/${UPSTREAM_DEFAULT}" --no-edit -m "chore: merge upstream ${UPSTREAM_DEFAULT}" || {
-            echo "Merge reported issues; attempting to complete with ours strategy..."
-            git checkout --ours . || true
-            git add -A
-            git commit --trailer "Co-authored-by: Cursor <cursoragent@cursor.com>" --no-edit || true
-          }
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_DEFAULT}" HEAD; then
+            echo "Local default already contains upstream/${UPSTREAM_DEFAULT}"
+          else
+            git merge -X ours "upstream/${UPSTREAM_DEFAULT}" --no-edit -m "chore: merge upstream ${UPSTREAM_DEFAULT}" || {
+              echo "Merge reported issues; attempting to complete with ours strategy..."
+              git checkout --ours . || true
+              # Keep our workflow file explicitly
+              git checkout HEAD -- .github/workflows/sync-upstream.yml || true
+              git add -A
+              git commit --trailer "Co-authored-by: Cursor <cursoragent@cursor.com>" --no-edit || true
+            }
+          fi
 
           # Ensure workflow file still exists after merge
           if [ ! -f .github/workflows/sync-upstream.yml ]; then
@@ -74,4 +80,9 @@ jobs:
           git push origin "${DEFAULT_BRANCH}"
 
           # Force-copy all tags from upstream
-          git push --force origin "refs/tags/*:refs/tags/*" || true
+          if git for-each-ref --format='%(refname)' refs/tags | grep -q .; then
+            git push --force origin "refs/tags/*:refs/tags/*" || true
+          else
+            # Push tags fetched from upstream even if none existed locally before fetch
+            git push --force origin "refs/tags/*:refs/tags/*" || true
+          fi
