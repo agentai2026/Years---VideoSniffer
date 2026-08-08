@@ -48,6 +48,7 @@ add_library(${PLUGIN_NAME} SHARED
   "texture_bridge.cc"
   "texture_bridge_gpu.cc"
   "graphics_context.cc"
+  "util/content_disposition.cc"
   "util/direct3d11.interop.cc"
   "util/rohelper.cc"
   "util/string_converter.cc"

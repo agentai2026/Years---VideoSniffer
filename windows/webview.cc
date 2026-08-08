@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "util/composition.desktop.interop.h"
+#include "util/content_disposition.h"
 #include "util/string_converter.h"
 #include "webview_host.h"
 
@@ -101,10 +102,6 @@ Webview::~Webview() {
       }
     }
     
-    if (event_registrations_.web_resource_requested_token_.value != 0) {
-      webview_->remove_WebResourceRequested(event_registrations_.web_resource_requested_token_);
-    }
-
     if (event_registrations_.source_changed_token_.value != 0) {
       webview_->remove_SourceChanged(event_registrations_.source_changed_token_);
     }
@@ -504,109 +501,99 @@ void Webview::RegisterEventHandlers() {
           .Get(),
       &event_registrations_.contains_fullscreen_element_changed_token_);
 
-  // Add web resource response received event to monitor M3U files based on response content and video files based on content-type
+  // Detect video metadata and M3U content from resource responses.
   wil::com_ptr<ICoreWebView2_2> webview2;
   webview2 = webview_.try_query<ICoreWebView2_2>();
   if (webview2) {
-    webview2->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
     webview2->add_WebResourceResponseReceived(
         Callback<ICoreWebView2WebResourceResponseReceivedEventHandler>(
             [this](ICoreWebView2* sender,
                    ICoreWebView2WebResourceResponseReceivedEventArgs* args) -> HRESULT {
-              if (!web_resource_response_received_callback_ && !video_source_loaded_callback_ && !source_loaded_callback_) {
+              if (!web_resource_response_received_callback_ &&
+                  !video_source_loaded_callback_ && !source_loaded_callback_) {
                 return S_OK;
               }
 
               wil::com_ptr<ICoreWebView2WebResourceRequest> request;
               wil::com_ptr<ICoreWebView2WebResourceResponseView> response;
-              
-              if (FAILED(args->get_Request(&request)) || FAILED(args->get_Response(&response))) {
+              if (FAILED(args->get_Request(&request)) ||
+                  FAILED(args->get_Response(&response))) {
                 return S_OK;
               }
 
               wil::unique_cotaskmem_string uri, method;
-              if (FAILED(request->get_Uri(&uri)) || FAILED(request->get_Method(&method))) {
+              if (FAILED(request->get_Uri(&uri)) ||
+                  FAILED(request->get_Method(&method))) {
                 return S_OK;
               }
 
-              std::string url = util::Utf8FromUtf16(uri.get());
-              std::string http_method = util::Utf8FromUtf16(method.get());
-
-              // Get response headers to check content-type for video detection
+              const std::string url = util::Utf8FromUtf16(uri.get());
+              const std::string http_method = util::Utf8FromUtf16(method.get());
+              // Detect videos from response metadata without reading the body.
+              std::string content_type_str;
+              std::string content_disposition_str;
               wil::com_ptr<ICoreWebView2HttpResponseHeaders> headers;
               if (SUCCEEDED(response->get_Headers(&headers))) {
                 wil::unique_cotaskmem_string content_type;
-                if (SUCCEEDED(headers->GetHeader(L"content-type", &content_type)) && content_type) {
-                  std::string content_type_str = util::Utf8FromUtf16(content_type.get());
-                  
-                  // Check if content-type contains "video/"
-                  if (content_type_str.find("video/") != std::string::npos && video_source_loaded_callback_) {
-                    video_source_loaded_callback_(url, http_method, content_type_str);
-                  }
-                  
-                  // Call the general source loaded callback for all sources (debugging)
-                  if (source_loaded_callback_) {
-                    source_loaded_callback_(url, http_method, content_type_str);
-                  }
-                } else {
-                  // If no content-type header, still call the source loaded callback with empty content-type
-                  if (source_loaded_callback_) {
-                    source_loaded_callback_(url, http_method, "");
-                  }
+                if (SUCCEEDED(headers->GetHeader(L"content-type",
+                                                 &content_type)) &&
+                    content_type) {
+                  content_type_str = util::Utf8FromUtf16(content_type.get());
                 }
-              } else {
-                // If headers retrieval failed, still call the source loaded callback
-                if (source_loaded_callback_) {
-                  source_loaded_callback_(url, http_method, "");
+
+                wil::unique_cotaskmem_string content_disposition;
+                if (SUCCEEDED(headers->GetHeader(L"content-disposition",
+                                                 &content_disposition)) &&
+                    content_disposition) {
+                  content_disposition_str =
+                      util::Utf8FromUtf16(content_disposition.get());
                 }
               }
 
-              // Get response content using GetContent method for M3U detection
-              if (web_resource_response_received_callback_) {
+              const bool is_video_response =
+                  content_type_str.find("video/") != std::string::npos ||
+                  util::HasVideoFilename(content_disposition_str);
+              if (is_video_response && video_source_loaded_callback_) {
+                video_source_loaded_callback_(url, http_method,
+                                              content_type_str);
+              }
+
+              if (source_loaded_callback_) {
+                source_loaded_callback_(url, http_method, content_type_str);
+              }
+
+              if (web_resource_response_received_callback_ &&
+                  !is_video_response) {
                 response->GetContent(
                     Callback<ICoreWebView2WebResourceResponseViewGetContentCompletedHandler>(
                         [this, url, http_method](HRESULT result, IStream* content_stream) -> HRESULT {
                           if (FAILED(result) || !content_stream) {
                             return S_OK;
                           }
-                          
-                          // Read the first part of the response to check for M3U header
-                          char buffer[8192] = {0};
+
+                          char buffer[8192];
                           ULONG bytes_read = 0;
-                          
-                          if (SUCCEEDED(content_stream->Read(buffer, sizeof(buffer) - 1, &bytes_read)) && bytes_read > 0) {
-                            buffer[bytes_read] = '\0';
-                            std::string content(buffer, bytes_read);
-                            
-                            // Check ONLY if content starts with exactly "#EXTM3U" (first 7 characters)
-                            if (content.length() >= 7 && content.substr(0, 7) == "#EXTM3U") {
-                              // Call the callback for this M3U content
-                              if (web_resource_response_received_callback_) {
-                                web_resource_response_received_callback_(url, http_method, content);
-                              }
-                            }
+                          if (FAILED(content_stream->Read(
+                                  buffer, sizeof(buffer), &bytes_read)) ||
+                              bytes_read == 0) {
+                            return S_OK;
                           }
-                          
+
+                          const std::string content(buffer, bytes_read);
+                          if (content.starts_with("#EXTM3U") &&
+                              web_resource_response_received_callback_) {
+                            web_resource_response_received_callback_(
+                                url, http_method, content);
+                          }
+
                           return S_OK;
                         }).Get());
               }
-                      
+
               return S_OK;
             })
             .Get(),
         &event_registrations_.web_resource_response_received_token_);
-  } else {
-    // Fallback to WebResourceRequested for older WebView2 versions (content inspection not available)
-    webview_->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
-    webview_->add_WebResourceRequested(
-        Callback<ICoreWebView2WebResourceRequestedEventHandler>(
-            [this](ICoreWebView2* sender,
-                   ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
-              // In fallback mode, we can only monitor URLs but cannot check response content
-              return S_OK;
-            })
-            .Get(),
-        &event_registrations_.web_resource_requested_token_);
   }
 }
 
